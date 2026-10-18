@@ -15,8 +15,8 @@ class RaggaMuffinApp:
     def __init__(self, root):
         self.root = root
         root.title("RaggaMuffin — Furby Connect")
-        root.geometry("700x470")
-        root.minsize(600, 380)
+        root.geometry("940x700")
+        root.minsize(760, 560)
         self.devices = []
         self.busy = False
         main = ttk.Frame(root, padding=16)
@@ -39,10 +39,22 @@ class RaggaMuffinApp:
         self.listbox = tk.Listbox(main, height=7, exportselection=False)
         self.listbox.pack(fill="x")
         self.listbox.bind("<<ListboxSelect>>", lambda _event: self.update_buttons())
-        ttk.Label(main, text="Results / service details:").pack(anchor="w", pady=(10, 3))
-        self.log = tk.Text(main, height=10, wrap="word", state="disabled")
+        notebook = ttk.Notebook(main)
+        notebook.pack(fill="both", expand=True, pady=(10, 0))
+        map_tab = ttk.Frame(notebook)
+        log_tab = ttk.Frame(notebook)
+        notebook.add(map_tab, text="2D Furby Hardware Map")
+        notebook.add(log_tab, text="Bluetooth Details")
+        self.map_canvas = tk.Canvas(map_tab, width=875, height=420, background="#f5f8fc", highlightthickness=0)
+        self.map_canvas.pack(fill="both", expand=True)
+        self.map_canvas.bind("<Configure>", lambda _e: self.draw_map())
+        self.map_canvas.bind("<Button-1>", self.map_clicked)
+        self.map_note = tk.StringVar(value="Select a part on the map. Green = tested; blue = Bluetooth detected; amber = next experiment.")
+        ttk.Label(map_tab, textvariable=self.map_note, wraplength=850).pack(anchor="w", pady=4)
+        self.log = tk.Text(log_tab, height=10, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True)
-        ttk.Label(main, text="Antenna light test sends one documented RGB command only after you click. No firmware, audio, or motor commands.", wraplength=660).pack(anchor="w", pady=(7, 0))
+        ttk.Label(main, text="Antenna LED control is tested. Other features are shown as investigation targets, not enabled hardware controls.", wraplength=900).pack(anchor="w", pady=(7, 0))
+
 
     def write(self, message):
         self.log.configure(state="normal")
@@ -135,6 +147,57 @@ class RaggaMuffinApp:
             self.write("Antenna test failed: " + error if error else result)
             self.set_busy(False, "Antenna test finished." if not error else "Antenna test did not finish.")
         self.launch(work, done)
+
+
+    def draw_map(self):
+        c = self.map_canvas
+        c.delete("all")
+        w = max(c.winfo_width(), 760)
+        h = max(c.winfo_height(), 360)
+        center = w / 2
+        # Flat two-dimensional schematic rather than an unsupported 3-D or physical cutaway.
+        c.create_oval(center-130, 97, center+130, h-22, fill="#46c1d7", outline="#16758e", width=4)
+        c.create_polygon(center-100, 175, center-164, 42, center-34, 105, fill="#5cbed6", outline="#16758e", width=3)
+        c.create_polygon(center+100, 175, center+164, 42, center+34, 105, fill="#5cbed6", outline="#16758e", width=3)
+        c.create_oval(center-90, 122, center+90, 258, fill="#ecf4f8", outline="#b9d1d9", width=3)
+        for dx in (-43, 43):
+            c.create_oval(center+dx-34, 151, center+dx+34, 217, fill="#242557", outline="#707dde", width=3)
+            c.create_oval(center+dx-15, 167, center+dx+15, 199, fill="#9ec6ff", outline="")
+        c.create_oval(center-30, 206, center+30, 247, fill="#ffc04f", outline="#b77724", width=3)
+        c.create_line(center, 97, center, 43, fill="#578795", width=8)
+        c.create_oval(center-17, 20, center+17, 54, fill="#a5f2dd", outline="#087b55", width=3, tags="antenna")
+        c.create_text(center, 10, text="ANTENNA LED • VERIFIED", fill="#087b55", font=("Segoe UI", 10, "bold"))
+        c.create_text(center, h-15, text="FURBY CONNECT 2016 • schematic, not a wiring diagram", fill="#56677c", font=("Segoe UI", 9))
+        specs = [
+            ("Bluetooth / BLE", "DETECTED", "#276ec1", 18, 45, center-125, 120),
+            ("Touch / petting", "UNTESTED", "#bd6d15", 18, 116, center-106, 180),
+            ("Tilt / movement", "UNTESTED", "#bd6d15", 18, 187, center-95, 286),
+            ("Sound input", "UNTESTED", "#bd6d15", 18, 258, center-85, 328),
+            ("Internal events", "UNTESTED", "#bd6d15", 18, 329, center-60, 330),
+            ("Antenna light", "VERIFIED", "#168452", w-219, 45, center+16, 37),
+            ("Eye animation", "UNTESTED", "#bd6d15", w-219, 116, center+45, 181),
+            ("Beak / mouth", "UNTESTED", "#bd6d15", w-219, 187, center+26, 230),
+            ("Body movement", "UNTESTED", "#bd6d15", w-219, 258, center+99, 299),
+            ("Speaker / audio", "UNTESTED", "#bd6d15", w-219, 329, center+55, 332),
+        ]
+        self.map_regions = []
+        for name, status, color, x, y, targetx, targety in specs:
+            c.create_line(x + (194 if x < center else 0), y+20, targetx, targety, fill=color, width=2)
+            c.create_rectangle(x, y, x+194, y+41, fill="#ffffff", outline=color, width=2)
+            c.create_text(x+8, y+10, anchor="w", text=name, fill="#273c50", font=("Segoe UI", 10, "bold"))
+            c.create_text(x+8, y+29, anchor="w", text=status, fill=color, font=("Segoe UI", 9))
+            self.map_regions.append((x, y, x+194, y+41, name))
+
+    def map_clicked(self, event):
+        for x1, y1, x2, y2, name in getattr(self, "map_regions", []):
+            if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+                if name == "Antenna light":
+                    self.map_note.set("LED is confirmed. Choose a color above and click Test antenna light.")
+                elif name == "Bluetooth / BLE":
+                    self.map_note.set("BLE connection and custom Furby services have been confirmed. Use Connect & inspect.")
+                else:
+                    self.map_note.set(name + ": hardware capability to investigate; no tested command is enabled yet.")
+                return
 
 
 if __name__ == "__main__":
