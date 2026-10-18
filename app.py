@@ -1,9 +1,14 @@
-"""RaggaMuffin Windows Bluetooth explorer (read-only)."""
+"""RaggaMuffin Windows Bluetooth explorer with a limited antenna LED test."""
 import asyncio
 import threading
 import tkinter as tk
 from tkinter import ttk
 from bleak import BleakScanner, BleakClient
+
+FURBY_SERVICE = 'dab91435-b5a1-e29c-b041-bcd562613bde'
+FURBY_WRITE = 'dab91383-b5a1-e29c-b041-bcd562613bde'
+# Documented Bluefluff GeneralPlus command 0x14 followed by RGB.
+ANTENNA_COLORS = {'Red': (255, 0, 0), 'Green': (0, 255, 0), 'Blue': (0, 0, 255), 'Off': (0, 0, 0)}
 
 
 class RaggaMuffinApp:
@@ -24,6 +29,11 @@ class RaggaMuffinApp:
         self.scan_btn.pack(side="left")
         self.connect_btn = ttk.Button(bar, text="Connect & inspect", command=self.connect, state="disabled")
         self.connect_btn.pack(side="left", padx=8)
+        self.color = tk.StringVar(value="Blue")
+        self.color_choice = ttk.Combobox(bar, textvariable=self.color, values=list(ANTENNA_COLORS), state="readonly", width=8)
+        self.color_choice.pack(side="left", padx=(8, 2))
+        self.led_btn = ttk.Button(bar, text="Test antenna light", command=self.antenna_test, state="disabled")
+        self.led_btn.pack(side="left", padx=4)
         self.status = tk.StringVar(value="Ready. No connection or commands sent.")
         ttk.Label(main, textvariable=self.status).pack(anchor="w", pady=8)
         self.listbox = tk.Listbox(main, height=7, exportselection=False)
@@ -32,7 +42,7 @@ class RaggaMuffinApp:
         ttk.Label(main, text="Results / service details:").pack(anchor="w", pady=(10, 3))
         self.log = tk.Text(main, height=10, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True)
-        ttk.Label(main, text="Read-only: discovers devices and enumerates GATT services. No pairing PIN, firmware changes, or motor commands.", wraplength=660).pack(anchor="w", pady=(7, 0))
+        ttk.Label(main, text="Antenna light test sends one documented RGB command only after you click. No firmware, audio, or motor commands.", wraplength=660).pack(anchor="w", pady=(7, 0))
 
     def write(self, message):
         self.log.configure(state="normal")
@@ -49,6 +59,7 @@ class RaggaMuffinApp:
         self.scan_btn.configure(state="disabled" if self.busy else "normal")
         has_choice = len(self.listbox.curselection()) == 1
         self.connect_btn.configure(state="normal" if has_choice and not self.busy else "disabled")
+        self.led_btn.configure(state="normal" if has_choice and not self.busy else "disabled")
 
     def launch(self, coroutine, finish):
         def worker():
@@ -99,6 +110,30 @@ class RaggaMuffinApp:
         def done(result, error):
             self.write("Connection failed: " + error if error else result)
             self.set_busy(False, "Connection complete." if not error else "Could not connect; wake Furby and retry.")
+        self.launch(work, done)
+
+
+    def antenna_test(self):
+        selection = self.listbox.curselection()
+        if not selection:
+            return
+        device = self.devices[selection[0]]
+        color_name = self.color.get()
+        rgb = ANTENNA_COLORS[color_name]
+        self.set_busy(True, "Connecting for a single antenna-light command...")
+        async def work():
+            async with BleakClient(device, timeout=15.0) as client:
+                service_uuids = {str(service.uuid).lower() for service in client.services}
+                if FURBY_SERVICE not in service_uuids:
+                    raise RuntimeError("Selected device does not expose the known Furby Connect service. No command sent.")
+                char_uuids = {str(char.uuid).lower() for service in client.services for char in service.characteristics}
+                if FURBY_WRITE not in char_uuids:
+                    raise RuntimeError("Expected Furby control characteristic was not found. No command sent.")
+                await client.write_gatt_char(FURBY_WRITE, bytes((0x14, *rgb)), response=False)
+            return f"Sent documented antenna RGB command: {color_name} {rgb}. Disconnected."
+        def done(result, error):
+            self.write("Antenna test failed: " + error if error else result)
+            self.set_busy(False, "Antenna test finished." if not error else "Antenna test did not finish.")
         self.launch(work, done)
 
 
