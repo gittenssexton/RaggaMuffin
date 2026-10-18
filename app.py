@@ -1,11 +1,13 @@
 """RaggaMuffin Windows Bluetooth explorer with a limited antenna LED test."""
 import asyncio
 import threading
+import concurrent.futures
 import tkinter as tk
 from tkinter import ttk
 from bleak import BleakScanner, BleakClient
 
 FURBY_SERVICE = 'dab91435-b5a1-e29c-b041-bcd562613bde'
+FURBY_NOTIFY = 'dab91382-b5a1-e29c-b041-bcd562613bde'
 FURBY_WRITE = 'dab91383-b5a1-e29c-b041-bcd562613bde'
 # Documented Bluefluff GeneralPlus command 0x14 followed by RGB.
 ANTENNA_COLORS = {'Red': (255, 0, 0), 'Green': (0, 255, 0), 'Blue': (0, 0, 255), 'Off': (0, 0, 0)}
@@ -19,6 +21,14 @@ class RaggaMuffinApp:
         root.minsize(760, 560)
         self.devices = []
         self.busy = False
+        self.client = None
+        self.connected = False
+        self.loop = asyncio.new_event_loop()
+        self.ble_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.ble_thread.start()
+        self.notification_count = 0
+        self.sensor_count = 0
+        self.root.protocol('WM_DELETE_WINDOW', self.on_close)
         main = ttk.Frame(root, padding=16)
         main.pack(fill="both", expand=True)
         ttk.Label(main, text="RaggaMuffin — Furby Connect", font=("Segoe UI", 16, "bold")).pack(anchor="w")
@@ -27,13 +37,17 @@ class RaggaMuffinApp:
         bar.pack(fill="x")
         self.scan_btn = ttk.Button(bar, text="Scan Bluetooth (15s)", command=self.scan)
         self.scan_btn.pack(side="left")
-        self.connect_btn = ttk.Button(bar, text="Connect & inspect", command=self.connect, state="disabled")
+        self.connect_btn = ttk.Button(bar, text="Connect & monitor", command=self.connect, state="disabled")
         self.connect_btn.pack(side="left", padx=8)
+        self.disconnect_btn = ttk.Button(bar, text="Disconnect", command=self.disconnect, state="disabled")
+        self.disconnect_btn.pack(side="left", padx=(0, 8))
         self.color = tk.StringVar(value="Blue")
         self.color_choice = ttk.Combobox(bar, textvariable=self.color, values=list(ANTENNA_COLORS), state="readonly", width=8)
         self.color_choice.pack(side="left", padx=(8, 2))
         self.led_btn = ttk.Button(bar, text="Test antenna light", command=self.antenna_test, state="disabled")
         self.led_btn.pack(side="left", padx=4)
+        self.monitor_var = tk.StringVar(value="Events: 0 | Sensor packets: 0")
+        ttk.Label(main, textvariable=self.monitor_var).pack(anchor="w", pady=(4, 0))
         self.status = tk.StringVar(value="Ready. No connection or commands sent.")
         ttk.Label(main, textvariable=self.status).pack(anchor="w", pady=8)
         self.listbox = tk.Listbox(main, height=7, exportselection=False)
@@ -49,11 +63,11 @@ class RaggaMuffinApp:
         self.map_canvas.pack(fill="both", expand=True)
         self.map_canvas.bind("<Configure>", lambda _e: self.draw_map())
         self.map_canvas.bind("<Button-1>", self.map_clicked)
-        self.map_note = tk.StringVar(value="Select a part on the map. Green = tested; blue = Bluetooth detected; amber = next experiment.")
+        self.map_note = tk.StringVar(value="Connect to Furby, then pet, tilt or move it. Raw event types are shown in Bluetooth Details.")
         ttk.Label(map_tab, textvariable=self.map_note, wraplength=850).pack(anchor="w", pady=4)
         self.log = tk.Text(log_tab, height=10, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True)
-        ttk.Label(main, text="Antenna LED control is tested. Other features are shown as investigation targets, not enabled hardware controls.", wraplength=900).pack(anchor="w", pady=(7, 0))
+        ttk.Label(main, text="Connect once and monitor raw GeneralPlus notifications. No firmware or motor control writes. Sensor classifications require verification.", wraplength=900).pack(anchor="w", pady=(7, 0))
 
 
     def write(self, message):
@@ -70,8 +84,9 @@ class RaggaMuffinApp:
     def update_buttons(self):
         self.scan_btn.configure(state="disabled" if self.busy else "normal")
         has_choice = len(self.listbox.curselection()) == 1
-        self.connect_btn.configure(state="normal" if has_choice and not self.busy else "disabled")
-        self.led_btn.configure(state="normal" if has_choice and not self.busy else "disabled")
+        self.connect_btn.configure(state="normal" if has_choice and not self.busy and not self.connected else "disabled")
+        self.disconnect_btn.configure(state="normal" if not self.busy and self.connected else "disabled")
+        self.led_btn.configure(state="normal" if has_choice and not self.busy and self.connected else "disabled")
 
     def launch(self, coroutine, finish):
         def worker():
@@ -103,51 +118,134 @@ class RaggaMuffinApp:
             self.set_busy(False, "Choose a device, then select Connect & inspect.")
         self.launch(work, done)
 
-    def connect(self):
-        selection = self.listbox.curselection()
-        if not selection:
-            return
-        device = self.devices[selection[0]]
-        self.set_busy(True, "Connecting and reading GATT service metadata...")
-        async def work():
-            lines = []
-            async with BleakClient(device, timeout=15.0) as client:
-                lines.append("Connected: " + str(client.is_connected))
-                for service in client.services:
-                    lines.append(f"Service: {service.uuid} ({service.description})")
-                    for characteristic in service.characteristics:
-                        lines.append(f"  Characteristic: {characteristic.uuid} [{', '.join(characteristic.properties)}]")
-            lines.append("Disconnected safely. No characteristic values were read or written.")
-            return "\n".join(lines)
-        def done(result, error):
-            self.write("Connection failed: " + error if error else result)
-            self.set_busy(False, "Connection complete." if not error else "Could not connect; wake Furby and retry.")
-        self.launch(work, done)
+    def ui(self, action, *args):
+        try:
+            self.root.after(0, lambda: action(*args))
+        except (RuntimeError, tk.TclError):
+            pass
 
+    def submit(self, coroutine, on_done):
+        future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        def completed(f):
+            try:
+                value = f.result()
+                self.ui(on_done, value, None)
+            except Exception as exc:
+                self.ui(on_done, None, str(exc))
+        future.add_done_callback(completed)
+
+    def receive(self, _sender, data):
+        payload = bytes(data)
+        self.notification_count += 1
+        if payload and payload[0] == 0x21:
+            self.sensor_count += 1
+            event_type = "Sensor status (0x21)"
+        elif payload and payload[0] == 0x20:
+            event_type = "Furby message (0x20)"
+        else:
+            event_type = "GeneralPlus response"
+        # No unsupported bit-to-sensor decoding: display only documented packet types.
+        self.ui(self.show_event, event_type, payload.hex(" ").upper(),
+                self.notification_count, self.sensor_count)
+
+    def show_event(self, kind, hex_data, total, sensors):
+        self.monitor_var.set(f"Events: {total} | Sensor packets: {sensors}")
+        self.write(f"{kind}: {hex_data}")
+        if sensors and kind.startswith("Sensor"):
+            self.map_note.set("Sensor activity received! Check the raw bytes under Bluetooth Details.")
+        self.draw_map()
+
+    async def open_connection(self, device):
+        if self.client is not None and self.client.is_connected:
+            return "Already connected."
+        client = BleakClient(device, timeout=20.0, disconnected_callback=self.lost_connection)
+        try:
+            await client.connect()
+            uuidset = {str(s.uuid).lower() for s in client.services}
+            charmap = {str(ch.uuid).lower(): ch for s in client.services for ch in s.characteristics}
+            if FURBY_SERVICE not in uuidset or FURBY_WRITE not in charmap or FURBY_NOTIFY not in charmap:
+                raise RuntimeError("Device does not expose the expected Furby Connect control and notification interface.")
+            await client.start_notify(FURBY_NOTIFY, self.receive)
+            self.client = client
+            return "Connected and subscribed to Furby GeneralPlus notifications."
+        except Exception:
+            if client.is_connected:
+                await client.disconnect()
+            raise
+
+    def lost_connection(self, _client):
+        self.ui(self.connection_lost)
+
+    def connection_lost(self):
+        self.connected = False
+        self.client = None
+        self.status.set("Disconnected.")
+        self.write("Bluetooth connection closed.")
+        self.update_buttons()
+        self.draw_map()
+
+    def connect(self):
+        choice = self.listbox.curselection()
+        if not choice:
+            return
+        device = self.devices[choice[0]]
+        self.set_busy(True, "Connecting and subscribing to sensor events...")
+        def done(message, error):
+            if error:
+                self.write("Connection failed: " + error)
+                self.set_busy(False, "Connection failed.")
+            else:
+                self.connected = True
+                self.write(message)
+                self.set_busy(False, "Connected: monitoring incoming events.")
+                self.draw_map()
+        self.submit(self.open_connection(device), done)
+
+    async def close_connection(self):
+        client = self.client
+        self.client = None
+        if client and client.is_connected:
+            try:
+                await client.stop_notify(FURBY_NOTIFY)
+            finally:
+                await client.disconnect()
+        return "Disconnected safely."
+
+    def disconnect(self):
+        self.set_busy(True, "Disconnecting...")
+        def done(message, error):
+            self.connected = False
+            self.write(error or message)
+            self.set_busy(False, "Disconnected.")
+            self.draw_map()
+        self.submit(self.close_connection(), done)
 
     def antenna_test(self):
-        selection = self.listbox.curselection()
-        if not selection:
+        if not self.connected:
+            self.write("Connect to Furby first.")
             return
-        device = self.devices[selection[0]]
         color_name = self.color.get()
         rgb = ANTENNA_COLORS[color_name]
-        self.set_busy(True, "Connecting for a single antenna-light command...")
+        self.set_busy(True, "Sending antenna color...")
         async def work():
-            async with BleakClient(device, timeout=15.0) as client:
-                service_uuids = {str(service.uuid).lower() for service in client.services}
-                if FURBY_SERVICE not in service_uuids:
-                    raise RuntimeError("Selected device does not expose the known Furby Connect service. No command sent.")
-                char_uuids = {str(char.uuid).lower() for service in client.services for char in service.characteristics}
-                if FURBY_WRITE not in char_uuids:
-                    raise RuntimeError("Expected Furby control characteristic was not found. No command sent.")
-                await client.write_gatt_char(FURBY_WRITE, bytes((0x14, *rgb)), response=False)
-            return f"Sent documented antenna RGB command: {color_name} {rgb}. Disconnected."
-        def done(result, error):
-            self.write("Antenna test failed: " + error if error else result)
-            self.set_busy(False, "Antenna test finished." if not error else "Antenna test did not finish.")
-        self.launch(work, done)
+            client = self.client
+            if not client or not client.is_connected:
+                raise RuntimeError("Furby is disconnected.")
+            await client.write_gatt_char(FURBY_WRITE, bytes((0x14, *rgb)), response=False)
+            return f"Antenna command: {color_name} {rgb}"
+        def done(message, error):
+            self.write(error or message)
+            self.set_busy(False, "Connected: monitoring incoming events." if not error else "Antenna command failed.")
+        self.submit(work(), done)
 
+    def on_close(self):
+        # Request disconnect before shutting down the BLE event loop.
+        try:
+            future = asyncio.run_coroutine_threadsafe(self.close_connection(), self.loop)
+            future.add_done_callback(lambda _f: self.loop.call_soon_threadsafe(self.loop.stop))
+        except RuntimeError:
+            pass
+        self.root.destroy()
 
     def draw_map(self):
         c = self.map_canvas
@@ -180,6 +278,7 @@ class RaggaMuffinApp:
             ("Body movement", "UNTESTED", "#bd6d15", w-219, 258, center+99, 299),
             ("Speaker / audio", "UNTESTED", "#bd6d15", w-219, 329, center+55, 332),
         ]
+        c.create_text(center, h-48, text=f"BLE: {'CONNECTED' if self.connected else 'DISCONNECTED'}  |  Sensor frames: {self.sensor_count}", fill="#166086", font=("Segoe UI", 10, "bold"))
         self.map_regions = []
         for name, status, color, x, y, targetx, targety in specs:
             c.create_line(x + (194 if x < center else 0), y+20, targetx, targety, fill=color, width=2)
