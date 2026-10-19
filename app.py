@@ -2,6 +2,8 @@
 import asyncio
 import threading
 import concurrent.futures
+import time
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk
 from bleak import BleakScanner, BleakClient
@@ -29,6 +31,9 @@ class RaggaMuffinApp:
         self.reconnect_attempt = 0
         self.selected_device = None
         self.connection_generation = 0
+        self.connected_at = None
+        self.disconnect_count = 0
+        self.last_packet_at = None
         self.loop = asyncio.new_event_loop()
         self.ble_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self.ble_thread.start()
@@ -57,7 +62,7 @@ class RaggaMuffinApp:
         self.led_btn.pack(side="left", padx=4)
         self.test_indicator_btn = ttk.Button(bar, text="Test indicator", command=self.test_indicator)
         self.test_indicator_btn.pack(side="left", padx=4)
-        self.monitor_var = tk.StringVar(value="Events: 0 | Sensor packets: 0")
+        self.monitor_var = tk.StringVar(value="Events: 0 | Sensor packets: 0 | Disconnects: 0")
         ttk.Label(main, textvariable=self.monitor_var).pack(anchor="w", pady=(4, 0))
         self.status = tk.StringVar(value="Ready. No connection or commands sent.")
         ttk.Label(main, textvariable=self.status).pack(anchor="w", pady=8)
@@ -83,7 +88,7 @@ class RaggaMuffinApp:
 
     def write(self, message):
         self.log.configure(state="normal")
-        self.log.insert("end", message + "\n")
+        self.log.insert("end", datetime.now().strftime("[%H:%M:%S] ") + message + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
 
@@ -152,6 +157,7 @@ class RaggaMuffinApp:
     def receive(self, _sender, data):
         payload = bytes(data)
         self.notification_count += 1
+        self.last_packet_at = time.monotonic()
         if payload and payload[0] == 0x21:
             self.sensor_count += 1
             event_type = "Sensor status (0x21)"
@@ -164,7 +170,7 @@ class RaggaMuffinApp:
                 self.notification_count, self.sensor_count)
 
     def show_event(self, kind, hex_data, total, sensors):
-        self.monitor_var.set(f"Events: {total} | Sensor packets: {sensors}")
+        self.monitor_var.set(f"Events: {total} | Sensor packets: {sensors} | Disconnects: {self.disconnect_count}")
         self.write(f"{kind}: {hex_data}")
         self.pulse_indicator()
         if sensors and kind.startswith("Sensor"):
@@ -196,10 +202,16 @@ class RaggaMuffinApp:
         # Ignore stale callbacks from an earlier BLE session.
         if self.client is not client:
             return
+        duration = time.monotonic() - self.connected_at if self.connected_at else None
+        self.disconnect_count += 1
+        if duration is not None and duration >= 60:
+            self.reconnect_attempt = 0
         self.connected = False
         self.client = None
+        elapsed = f" after {duration:.1f}s" if duration is not None else ""
         self.status.set("Bluetooth connection lost.")
-        self.write("Bluetooth connection lost unexpectedly.")
+        self.write(f"Bluetooth connection lost unexpectedly{elapsed}. Drop #{self.disconnect_count}.")
+        self.connected_at = None
         self.update_buttons()
         self.draw_map()
         if not self.manual_disconnect and self.reconnect_enabled.get():
@@ -253,7 +265,9 @@ class RaggaMuffinApp:
             else:
                 self.connected = bool(self.client and self.client.is_connected)
                 if self.connected:
-                    self.reconnect_attempt = 0
+                    # A fleeting connection should not reset the retry budget.
+                    # Only a stable connection lasting >=60s resets it upon loss.
+                    self.connected_at = time.monotonic()
                     self.write(message)
                     self.set_busy(False, "Connected: monitoring incoming events.")
                 else:
