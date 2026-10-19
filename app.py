@@ -23,6 +23,12 @@ class RaggaMuffinApp:
         self.busy = False
         self.client = None
         self.connected = False
+        self.manual_disconnect = False
+        self.reconnect_enabled = tk.BooleanVar(value=True)
+        self.reconnect_job = None
+        self.reconnect_attempt = 0
+        self.selected_device = None
+        self.connection_generation = 0
         self.loop = asyncio.new_event_loop()
         self.ble_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self.ble_thread.start()
@@ -43,6 +49,7 @@ class RaggaMuffinApp:
         self.connect_btn.pack(side="left", padx=8)
         self.disconnect_btn = ttk.Button(bar, text="Disconnect", command=self.disconnect, state="disabled")
         self.disconnect_btn.pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(main, text="Auto-reconnect after unexpected disconnect", variable=self.reconnect_enabled).pack(anchor="w", pady=(6, 0))
         self.color = tk.StringVar(value="Blue")
         self.color_choice = ttk.Combobox(bar, textvariable=self.color, values=list(ANTENNA_COLORS), state="readonly", width=8)
         self.color_choice.pack(side="left", padx=(8, 2))
@@ -86,7 +93,7 @@ class RaggaMuffinApp:
         self.update_buttons()
 
     def update_buttons(self):
-        self.scan_btn.configure(state="disabled" if self.busy else "normal")
+        self.scan_btn.configure(state="disabled" if self.busy or self.connected else "normal")
         has_choice = len(self.listbox.curselection()) == 1
         self.connect_btn.configure(state="normal" if has_choice and not self.busy and not self.connected else "disabled")
         self.disconnect_btn.configure(state="normal" if not self.busy and self.connected else "disabled")
@@ -103,6 +110,10 @@ class RaggaMuffinApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def scan(self):
+        if self.connected:
+            self.write("Disconnect before scanning; scanning while connected may interrupt BLE on some adapters.")
+            return
+        self.cancel_reconnect()
         self.listbox.delete(0, "end")
         self.devices.clear()
         self.set_busy(True, "Scanning Bluetooth Low Energy devices for 15 seconds...")
@@ -178,31 +189,77 @@ class RaggaMuffinApp:
                 await client.disconnect()
             raise
 
-    def lost_connection(self, _client):
-        self.ui(self.connection_lost)
+    def lost_connection(self, client):
+        self.ui(self.connection_lost, client)
 
-    def connection_lost(self):
+    def connection_lost(self, client):
+        # Ignore stale callbacks from an earlier BLE session.
+        if self.client is not client:
+            return
         self.connected = False
         self.client = None
-        self.status.set("Disconnected.")
-        self.write("Bluetooth connection closed.")
+        self.status.set("Bluetooth connection lost.")
+        self.write("Bluetooth connection lost unexpectedly.")
         self.update_buttons()
         self.draw_map()
+        if not self.manual_disconnect and self.reconnect_enabled.get():
+            self.schedule_reconnect()
+
+    def cancel_reconnect(self):
+        if self.reconnect_job is not None:
+            self.root.after_cancel(self.reconnect_job)
+            self.reconnect_job = None
+
+    def schedule_reconnect(self):
+        if self.manual_disconnect or self.connected or self.busy or self.reconnect_job is not None:
+            return
+        self.reconnect_attempt += 1
+        if self.reconnect_attempt > 5:
+            self.status.set("Reconnect paused after 5 attempts; use Connect & monitor.")
+            self.write("Reconnect paused. Check batteries, distance, or competing apps.")
+            return
+        delay = min(30000, 1000 * (2 ** (self.reconnect_attempt - 1)))
+        self.status.set(f"Retrying Bluetooth in {delay // 1000}s (attempt {self.reconnect_attempt}/5)...")
+        self.reconnect_job = self.root.after(delay, self.retry_connect)
+
+    def retry_connect(self):
+        self.reconnect_job = None
+        if self.manual_disconnect or self.connected or self.busy or self.selected_device is None:
+            return
+        self.start_connection(self.selected_device, automatic=True)
 
     def connect(self):
         choice = self.listbox.curselection()
         if not choice:
             return
-        device = self.devices[choice[0]]
-        self.set_busy(True, "Connecting and subscribing to sensor events...")
+        self.manual_disconnect = False
+        self.reconnect_attempt = 0
+        self.cancel_reconnect()
+        self.selected_device = self.devices[choice[0]]
+        self.start_connection(self.selected_device)
+
+    def start_connection(self, device, automatic=False):
+        self.connection_generation += 1
+        generation = self.connection_generation
+        self.set_busy(True, "Reconnecting..." if automatic else "Connecting and subscribing to sensor events...")
         def done(message, error):
+            if generation != self.connection_generation:
+                return
             if error:
-                self.write("Connection failed: " + error)
+                self.write("Bluetooth connection failed: " + error)
                 self.set_busy(False, "Connection failed.")
+                if self.reconnect_enabled.get() and not self.manual_disconnect:
+                    self.schedule_reconnect()
             else:
-                self.connected = True
-                self.write(message)
-                self.set_busy(False, "Connected: monitoring incoming events.")
+                self.connected = bool(self.client and self.client.is_connected)
+                if self.connected:
+                    self.reconnect_attempt = 0
+                    self.write(message)
+                    self.set_busy(False, "Connected: monitoring incoming events.")
+                else:
+                    self.set_busy(False, "Connection closed during setup.")
+                    if self.reconnect_enabled.get() and not self.manual_disconnect:
+                        self.schedule_reconnect()
                 self.draw_map()
         self.submit(self.open_connection(device), done)
 
@@ -217,6 +274,9 @@ class RaggaMuffinApp:
         return "Disconnected safely."
 
     def disconnect(self):
+        self.manual_disconnect = True
+        self.cancel_reconnect()
+        self.connection_generation += 1
         self.set_busy(True, "Disconnecting...")
         def done(message, error):
             self.connected = False
@@ -244,6 +304,8 @@ class RaggaMuffinApp:
         self.submit(work(), done)
 
     def on_close(self):
+        self.manual_disconnect = True
+        self.cancel_reconnect()
         # Request disconnect before shutting down the BLE event loop.
         try:
             future = asyncio.run_coroutine_threadsafe(self.close_connection(), self.loop)
