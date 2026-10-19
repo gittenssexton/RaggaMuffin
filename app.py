@@ -12,6 +12,8 @@ FURBY_SERVICE = 'dab91435-b5a1-e29c-b041-bcd562613bde'
 FURBY_NOTIFY = 'dab91382-b5a1-e29c-b041-bcd562613bde'
 FURBY_WRITE = 'dab91383-b5a1-e29c-b041-bcd562613bde'
 # Documented Bluefluff GeneralPlus command 0x14 followed by RGB.
+# Fixed action IDs from Jeija/bluefluff doc/actionlist.md.
+SAFE_ACTIONS = {"Friendly phrase": (1, 0, 0, 0), "Friendly purr": (1, 2, 1, 1), "Short giggle": (2, 0, 0, 1)}
 ANTENNA_COLORS = {'Red': (255, 0, 0), 'Green': (0, 255, 0), 'Blue': (0, 0, 255), 'Off': (0, 0, 0)}
 
 
@@ -58,6 +60,13 @@ class RaggaMuffinApp:
         self.color_choice.pack(side="left", padx=(8, 2))
         self.led_btn = ttk.Button(bar, text="Test antenna light", command=self.antenna_test, state="disabled")
         self.led_btn.pack(side="left", padx=4)
+        actions_bar = ttk.Frame(main)
+        actions_bar.pack(fill="x", pady=(7, 0))
+        ttk.Label(actions_bar, text="Real Furby actions:").pack(side="left")
+        self.action_name = tk.StringVar(value="Friendly phrase")
+        ttk.Combobox(actions_bar, textvariable=self.action_name, values=list(SAFE_ACTIONS), state="readonly", width=19).pack(side="left", padx=6)
+        self.action_btn = ttk.Button(actions_bar, text="Play action on Furby", command=self.play_action, state="disabled")
+        self.action_btn.pack(side="left")
         self.monitor_var = tk.StringVar(value="Events: 0 | Sensor packets: 0 | Disconnects: 0")
         ttk.Label(main, textvariable=self.monitor_var).pack(anchor="w", pady=(4, 0))
         self.status = tk.StringVar(value="Ready. No connection or commands sent.")
@@ -75,11 +84,11 @@ class RaggaMuffinApp:
         self.map_canvas.pack(fill="both", expand=True)
         self.map_canvas.bind("<Configure>", lambda _e: self.draw_map())
         self.map_canvas.bind("<Button-1>", self.map_clicked)
-        self.map_note = tk.StringVar(value="Only the antenna light is currently controllable. Other labeled parts show planned features, not buttons.")
+        self.map_note = tk.StringVar(value="Antenna LED and three documented built-in actions are available. Other labeled parts remain informational.")
         ttk.Label(map_tab, textvariable=self.map_note, wraplength=850).pack(anchor="w", pady=4)
         self.log = tk.Text(log_tab, height=10, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True)
-        ttk.Label(main, text="HOW TO USE: Scan -> select Furby -> Connect & monitor -> select Red/Green/Blue/Off -> Test antenna light. Other parts are informational only.", wraplength=900).pack(anchor="w", pady=(7, 0))
+        ttk.Label(main, text="HOW TO USE: Scan -> select Furby -> Connect & monitor -> test antenna light or Play action on Furby. Start with Friendly phrase.", wraplength=900).pack(anchor="w", pady=(7, 0))
 
 
     def write(self, message):
@@ -99,6 +108,7 @@ class RaggaMuffinApp:
         self.connect_btn.configure(state="normal" if has_choice and not self.busy and not self.connected else "disabled")
         self.disconnect_btn.configure(state="normal" if not self.busy and self.connected else "disabled")
         self.led_btn.configure(state="normal" if has_choice and not self.busy and self.connected else "disabled")
+        self.action_btn.configure(state="normal" if has_choice and not self.busy and self.connected else "disabled")
 
     def launch(self, coroutine, finish):
         def worker():
@@ -310,6 +320,27 @@ class RaggaMuffinApp:
         def done(message, error):
             self.write(error or message)
             self.set_busy(False, "Connected: monitoring incoming events." if not error else "Antenna command failed.")
+        self.submit(work(), done)
+
+    def play_action(self):
+        if not self.connected:
+            self.write("Connect to Furby first.")
+            return
+        name = self.action_name.get()
+        action = SAFE_ACTIONS.get(name)
+        if action is None:
+            return
+        self.set_busy(True, "Sending built-in Furby action...")
+        async def work():
+            client = self.client
+            if not client or not client.is_connected:
+                raise RuntimeError("Furby disconnected.")
+            # 0x13: specific action; 00, Input, Index, Subindex, Specific.
+            await client.write_gatt_char(FURBY_WRITE, bytes((0x13, 0x00, *action)), response=False)
+            return f"Sent built-in action '{name}' (input/index/subindex/specific={action})."
+        def done(message, error):
+            self.write(error or message)
+            self.set_busy(False, "Connected: action requested." if not error else "Action failed.")
         self.submit(work(), done)
 
     def on_close(self):
