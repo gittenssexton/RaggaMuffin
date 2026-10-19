@@ -39,8 +39,6 @@ class RaggaMuffinApp:
         self.ble_thread.start()
         self.notification_count = 0
         self.sensor_count = 0
-        self.indicator_on = False
-        self.indicator_job = None
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
         main = ttk.Frame(root, padding=16)
         main.pack(fill="both", expand=True)
@@ -60,8 +58,6 @@ class RaggaMuffinApp:
         self.color_choice.pack(side="left", padx=(8, 2))
         self.led_btn = ttk.Button(bar, text="Test antenna light", command=self.antenna_test, state="disabled")
         self.led_btn.pack(side="left", padx=4)
-        self.test_indicator_btn = ttk.Button(bar, text="Test indicator", command=self.test_indicator)
-        self.test_indicator_btn.pack(side="left", padx=4)
         self.monitor_var = tk.StringVar(value="Events: 0 | Sensor packets: 0 | Disconnects: 0")
         ttk.Label(main, textvariable=self.monitor_var).pack(anchor="w", pady=(4, 0))
         self.status = tk.StringVar(value="Ready. No connection or commands sent.")
@@ -79,11 +75,11 @@ class RaggaMuffinApp:
         self.map_canvas.pack(fill="both", expand=True)
         self.map_canvas.bind("<Configure>", lambda _e: self.draw_map())
         self.map_canvas.bind("<Button-1>", self.map_clicked)
-        self.map_note = tk.StringVar(value="Connect to Furby, then pet, tilt or move it. Raw event types are shown in Bluetooth Details.")
+        self.map_note = tk.StringVar(value="Only the antenna light is currently controllable. Other labeled parts show planned features, not buttons.")
         ttk.Label(map_tab, textvariable=self.map_note, wraplength=850).pack(anchor="w", pady=4)
         self.log = tk.Text(log_tab, height=10, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True)
-        ttk.Label(main, text="Connect once and monitor raw GeneralPlus notifications. No firmware or motor control writes. Sensor classifications require verification.", wraplength=900).pack(anchor="w", pady=(7, 0))
+        ttk.Label(main, text="HOW TO USE: Scan -> select Furby -> Connect & monitor -> select Red/Green/Blue/Off -> Test antenna light. Other parts are informational only.", wraplength=900).pack(anchor="w", pady=(7, 0))
 
 
     def write(self, message):
@@ -172,7 +168,6 @@ class RaggaMuffinApp:
     def show_event(self, kind, hex_data, total, sensors):
         self.monitor_var.set(f"Events: {total} | Sensor packets: {sensors} | Disconnects: {self.disconnect_count}")
         self.write(f"{kind}: {hex_data}")
-        self.pulse_indicator()
         if sensors and kind.startswith("Sensor"):
             self.map_note.set("Sensor activity received! Check the raw bytes under Bluetooth Details.")
         self.draw_map()
@@ -328,22 +323,6 @@ class RaggaMuffinApp:
             pass
         self.root.destroy()
 
-    def pulse_indicator(self):
-        self.indicator_on = True
-        if self.indicator_job is not None:
-            self.root.after_cancel(self.indicator_job)
-        self.draw_map()
-        self.indicator_job = self.root.after(900, self.reset_indicator)
-
-    def reset_indicator(self):
-        self.indicator_on = False
-        self.indicator_job = None
-        self.draw_map()
-
-    def test_indicator(self):
-        self.map_note.set("Indicator self-test: green light is simulated on screen; no Furby command sent.")
-        self.pulse_indicator()
-
     def draw_map(self):
         c = self.map_canvas
         c.delete("all")
@@ -375,8 +354,6 @@ class RaggaMuffinApp:
             ("Body movement", "UNTESTED", "#bd6d15", w-219, 258, center+99, 299),
             ("Speaker / audio", "UNTESTED", "#bd6d15", w-219, 329, center+55, 332),
         ]
-        c.create_oval(center-20, h-91, center+20, h-51, fill=("#25ce6b" if self.indicator_on else "#7d8895"), outline="#27394c", width=2)
-        c.create_text(center, h-98, text="EVENT", fill="#27394c", font=("Segoe UI", 9, "bold"))
         c.create_text(center, h-48, text=f"BLE: {'CONNECTED' if self.connected else 'DISCONNECTED'}  |  Sensor frames: {self.sensor_count}", fill="#166086", font=("Segoe UI", 10, "bold"))
         self.map_regions = []
         for name, status, color, x, y, targetx, targety in specs:
